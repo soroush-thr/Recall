@@ -1,0 +1,25 @@
+[project]
+name = "recall"
+version = "0.1.0"
+description = "Local-first personal memory system"
+requires-python = ">=3.11"
+dependencies = [
+  "typer>=0.12",           # CLI framework, type-hint driven
+  "pydantic>=2.0",         # frontmatter schema validation
+  "python-frontmatter>=1.1", # markdown/YAML round-trip parsing
+  "pathspec>=0.12",        # honour .gitignore during folder walks
+  "PyYAML>=6.0",           # YAML dump for card writing
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+recall = "recall.cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

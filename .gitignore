@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# vault is a separate repo by default; ignore if nested here for local testing
+vault/.recall/
+
+/temp
