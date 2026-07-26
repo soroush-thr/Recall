@@ -9,6 +9,7 @@ dependencies = [
   "python-frontmatter>=1.1", # markdown/YAML round-trip parsing
   "pathspec>=0.12",        # honour .gitignore during folder walks
   "PyYAML>=6.0",           # YAML dump for card writing
+  "mcp>=1.2",              # MCP server SDK (Phase 2)
 ]
 
 [project.optional-dependencies]
@@ -16,6 +17,7 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 recall = "recall.cli:app"
+recall-mcp = "recall.mcp_server:main"
 
 [build-system]
 requires = ["setuptools>=68"]

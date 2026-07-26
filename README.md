@@ -31,9 +31,12 @@ Building in phases per the build plan. Currently implemented:
   vault read/write/validate.
 - **Phase 1 — Store + lexical search**: SQLite index with FTS5 full-text search, section-aware
   chunking, content-hash change detection (skips reindexing unchanged cards), BM25 search.
+- **Phase 2 — MCP server**: `recall-mcp` exposes `memory_search`, `memory_get`, and `memory_stats`
+  over stdio, so any MCP client (Claude Code, Claude Desktop) can query the vault directly from a
+  chat session — no CLI switch required.
 
-Not yet built: MCP server (Phase 2), embeddings/hybrid retrieval (Phase 3), automated folder
-ingestion (Phase 4), backfill (Phase 5), reranking/hygiene tooling (Phase 6).
+Not yet built: embeddings/hybrid retrieval (Phase 3), automated folder ingestion (Phase 4),
+backfill (Phase 5), reranking/hygiene tooling (Phase 6).
 
 ## Setup
 
@@ -55,6 +58,99 @@ recall show <doc-id> [--vault <path>] # print a card
 ```
 
 `RECALL_VAULT` env var sets the default vault path so `--vault` can be omitted.
+
+## MCP server (Phase 2)
+
+`recall-mcp` runs a read-only MCP server over stdio, exposing the index to any MCP client:
+
+- `memory_search(query, type?, tag?, from_?, to?, k?)` — BM25 search, same filters as `recall search`.
+- `memory_get(doc_id)` — full markdown card (frontmatter + body) for an id.
+- `memory_stats()` — card counts by type plus the earliest/latest `started` date covered.
+
+It never writes to the vault. `confidential`-visibility cards are always excluded; set
+`RECALL_MCP_PUBLIC_ONLY=1` to additionally exclude `private` cards (useful if a client is ever
+shared beyond you).
+
+[.mcp.json](.mcp.json) in this repo wires `recall-mcp` into Claude Code and is checked in as-is —
+it deliberately contains **no vault path**, since that path is personal (different per machine,
+and the vault itself is a private repo). Instead, each person sets `RECALL_VAULT` as their own
+permanent environment variable, once, outside of git:
+
+```powershell
+setx RECALL_VAULT "C:\path\to\your\vault"    # Windows, permanent, new terminals only
+```
+
+```bash
+export RECALL_VAULT=/path/to/your/vault      # macOS/Linux, add to your shell profile
+```
+
+Restart Claude Code (and your terminal) after setting it so the new environment variable is
+picked up. `recall-mcp` inherits it like any other subprocess — no edits to `.mcp.json` needed,
+and nothing personal ever gets committed.
+
+## Example usage (Phases 0–2)
+
+Everything below runs against what's built today — no ingestion or embeddings yet, just cards you
+write by hand plus lexical search. Say a vault has three cards: two projects (`prj-marl-inventory-2024`,
+`prj-forecasta-2022`) and one person (`per-jane-doe`, the Forecasta client), linked with wikilinks.
+
+**1. "Have I ever built anything with reinforcement learning?"** — via CLI:
+
+```bash
+recall search "reinforcement learning inventory"
+```
+```
+MARL Inventory Management  [project]  2024-02-01–2024-06-01  score=5.80
+    MARL Inventory Management | project/research
+
+    A multi-agent reinforcement learning system for decentralized inventory manag
+    /vault/projects/prj-marl-inventory-2024.md
+```
+
+**2. Same question, from inside a Claude Code chat** — no terminal switch, Claude calls the MCP
+tool directly:
+
+```json
+memory_search("inventory management reinforcement learning", k=3)
+→ [{
+    "doc_id": "prj-marl-inventory-2024",
+    "title": "MARL Inventory Management",
+    "started": "2024-02-01", "ended": "2024-06-01",
+    "snippet": "...decentralized inventory management across a simulated retail supply chain...",
+    "path": "/vault/projects/prj-marl-inventory-2024.md"
+  }]
+```
+Claude can then call `memory_get("prj-marl-inventory-2024")` to pull the full card — problem,
+approach, results, lessons — into its answer instead of guessing from memory of the conversation.
+
+**3. Filtered search — "what freelance forecasting work have I done?"**
+
+```bash
+recall search "energy forecasting" --tag forecasting
+```
+```
+Forecasta Energy Forecasting  [project]  2022-03-01–2022-09-01  score=0.59
+    Time-series forecasting for energy demand for a small utility client...
+    /vault/projects/prj-forecasta-2022.md
+```
+
+**4. "Who was the client on that energy job, and what came of it?"** — `recall show
+prj-forecasta-2022` prints the full card, whose `client:` field wikilinks to `per-jane-doe`, whose
+own card records the relationship and `Projects Together`. Two linked cards answer a question that
+would otherwise depend on remembering a two-year-old email thread.
+
+**5. "What's actually in memory right now?"**
+
+```bash
+recall search "" # or, over MCP:
+memory_stats()
+→ {"total": 3, "by_type": {"person": 1, "project": 2},
+   "earliest": "2022-03-01", "latest": "2024-02-01"}
+```
+
+**6. Keeping Obsidian and the index in sync.** Edit a card's frontmatter in Obsidian, save, then
+`recall index` (no `--all` needed) — only that card's content hash changed, so only it gets
+re-chunked and re-indexed; everything else is skipped.
 
 ## Testing
 
