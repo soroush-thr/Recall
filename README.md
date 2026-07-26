@@ -34,9 +34,14 @@ Building in phases per the build plan. Currently implemented:
 - **Phase 2 — MCP server**: `recall-mcp` exposes `memory_search`, `memory_get`, and `memory_stats`
   over stdio, so any MCP client (Claude Code, Claude Desktop) can query the vault directly from a
   chat session — no CLI switch required.
+- **Phase 3 — Embeddings + hybrid retrieval**: `recall index` computes local dense embeddings
+  (`BAAI/bge-m3` by default, 1024-dim, no paid API) for every chunk and stores them alongside the
+  lexical index. `recall search` / `memory_search` fuse BM25 and cosine-similarity rankings with
+  Reciprocal Rank Fusion, so a Farsi query can retrieve an English card (or a query with no
+  keyword overlap can still find a conceptually related project) purely through the dense side.
 
-Not yet built: embeddings/hybrid retrieval (Phase 3), automated folder ingestion (Phase 4),
-backfill (Phase 5), reranking/hygiene tooling (Phase 6).
+Not yet built: automated folder ingestion (Phase 4), backfill (Phase 5), reranking/hygiene tooling
+(Phase 6).
 
 ## Setup
 
@@ -52,8 +57,12 @@ recall init <vault-path>              # create a new vault (type dirs + config)
 recall new <type> --title "..."       # create a card from template, open in $EDITOR
                                        #   <type>: project|person|episode|note|artifact
 recall validate [--vault <path>]      # validate all cards against schema
-recall index [--vault <path>] [--all] # build/update the SQLite index (--all rebuilds from scratch)
+recall index [--vault <path>] [--all] [--no-embed]
+                                       # build/update the SQLite index (--all rebuilds from scratch)
+                                       #   embeds by default (downloads the model on first run);
+                                       #   --no-embed skips embedding, lexical-only, no download/model load
 recall search "<query>" [--vault <path>] [--type project] [--tag x] [--from 2023] [--to 2025] [-k 10]
+                                       # hybrid BM25 + dense search, fused with RRF
 recall show <doc-id> [--vault <path>] # print a card
 ```
 
@@ -63,7 +72,8 @@ recall show <doc-id> [--vault <path>] # print a card
 
 `recall-mcp` runs a read-only MCP server over stdio, exposing the index to any MCP client:
 
-- `memory_search(query, type?, tag?, from_?, to?, k?)` — BM25 search, same filters as `recall search`.
+- `memory_search(query, type?, tag?, from_?, to?, k?)` — hybrid BM25 + dense search (RRF-fused), same
+  filters as `recall search`.
 - `memory_get(doc_id)` — full markdown card (frontmatter + body) for an id.
 - `memory_stats()` — card counts by type plus the earliest/latest `started` date covered.
 
@@ -152,6 +162,27 @@ memory_stats()
 `recall index` (no `--all` needed) — only that card's content hash changed, so only it gets
 re-chunked and re-indexed; everything else is skipped.
 
+## Embeddings & hybrid retrieval (Phase 3)
+
+`recall index` embeds every chunk locally with `sentence-transformers` (default model
+`BAAI/bge-m3`, configurable via `embedding_model:` in `.recall/config.yaml`). Nothing is sent
+anywhere — the model runs on your machine, downloaded once from Hugging Face and cached under the
+usual `~/.cache/huggingface` (or `%USERPROFILE%\.cache\huggingface` on Windows).
+
+```bash
+recall index --all           # first run: downloads bge-m3 (~2GB), embeds every chunk
+recall index                 # incremental: only new/changed cards get re-embedded
+recall index --no-embed      # lexical-only, skips the model entirely (fast, no download)
+```
+
+`recall search` / `memory_search` always try both rankers and fuse them with Reciprocal Rank
+Fusion — if a card has no embeddings yet (e.g. you ran `--no-embed`), the dense side contributes
+nothing and search silently falls back to BM25-only, no error, no model load.
+
+Changing `embedding_model` in config doesn't touch lexical data; the next `recall index` just
+re-embeds every chunk under the new model name (old vectors for the previous model stay until
+overwritten — `embeddings.model` tracks which model produced each row).
+
 ## Testing
 
 ```bash
@@ -159,7 +190,10 @@ re-chunked and re-indexed; everything else is skipped.
 ```
 
 Covers schema validation, markdown/frontmatter round-tripping (including non-ASCII text), and
-search correctness/idempotency/rebuild-reproducibility.
+search correctness/idempotency/rebuild-reproducibility. The hybrid-search tests
+(`test_hybrid_search.py`) use a small model (`all-MiniLM-L6-v2`, ~80MB) instead of `bge-m3` so the
+suite stays fast — `embedder.py` itself is model-agnostic, so this doesn't test anything
+model-specific.
 
 ## Design principles
 

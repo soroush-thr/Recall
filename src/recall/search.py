@@ -1,4 +1,4 @@
-"""Lexical (BM25) search over the index. Hybrid retrieval lands in Phase 3."""
+"""Hybrid (lexical + dense) search over the index, fused with RRF. See build plan §7."""
 
 from __future__ import annotations
 
@@ -6,7 +6,12 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 from recall.db import connect
+
+RRF_K = 60
+TOP_N_PER_RANKER = 50
 
 
 @dataclass
@@ -30,27 +35,29 @@ def search(
     date_from: str | None = None,
     date_to: str | None = None,
     k: int = 10,
+    embedding_model: str = "BAAI/bge-m3",
 ) -> list[SearchHit]:
     conn = connect(db_path)
     try:
-        return _search(conn, query, doc_type=doc_type, tag=tag, date_from=date_from, date_to=date_to, k=k)
+        return _search(
+            conn,
+            query,
+            doc_type=doc_type,
+            tag=tag,
+            date_from=date_from,
+            date_to=date_to,
+            k=k,
+            embedding_model=embedding_model,
+        )
     finally:
         conn.close()
 
 
-def _search(
-    conn: sqlite3.Connection,
-    query: str,
-    *,
-    doc_type: str | None,
-    tag: str | None,
-    date_from: str | None,
-    date_to: str | None,
-    k: int,
-) -> list[SearchHit]:
+def _doc_filter(
+    *, doc_type: str | None, tag: str | None, date_from: str | None, date_to: str | None
+) -> tuple[str, list]:
     filters = ["d.visibility != 'confidential'"]
     params: list = []
-
     if doc_type:
         filters.append("d.type = ?")
         params.append(doc_type)
@@ -63,12 +70,15 @@ def _search(
     if tag:
         filters.append("d.id IN (SELECT doc_id FROM tags WHERE tag = ?)")
         params.append(tag)
+    return " AND ".join(filters), params
 
-    where_clause = " AND ".join(filters)
 
+def _lexical_ranked_chunks(
+    conn: sqlite3.Connection, query: str, where_clause: str, params: list
+) -> list[sqlite3.Row]:
     sql = f"""
         SELECT
-          d.id AS doc_id, d.title AS title, d.type AS type,
+          c.chunk_id AS chunk_id, d.id AS doc_id, d.title AS title, d.type AS type,
           d.started AS started, d.ended AS ended, d.path AS path,
           c.text AS snippet,
           bm25(chunks_fts) AS raw_score
@@ -77,20 +87,97 @@ def _search(
         JOIN documents d ON d.id = c.doc_id
         WHERE chunks_fts MATCH ? AND {where_clause}
         ORDER BY raw_score
-        LIMIT 200
+        LIMIT {TOP_N_PER_RANKER}
     """
-    rows = conn.execute(sql, [_escape_fts_query(query), *params]).fetchall()
+    return conn.execute(sql, [_escape_fts_query(query), *params]).fetchall()
+
+
+def _dense_ranked_chunks(
+    conn: sqlite3.Connection,
+    query: str,
+    where_clause: str,
+    params: list,
+    embedding_model: str,
+) -> list[tuple[str, str, sqlite3.Row, float]]:
+    """Returns (chunk_id, doc_id, chunk_row, cosine_score) sorted best-first, top N."""
+    count_sql = f"""
+        SELECT COUNT(*) AS n
+        FROM embeddings e
+        JOIN chunks c ON c.chunk_id = e.chunk_id
+        JOIN documents d ON d.id = c.doc_id
+        WHERE e.model = ? AND {where_clause}
+    """
+    n = conn.execute(count_sql, [embedding_model, *params]).fetchone()["n"]
+    if not n:
+        return []
+
+    from recall.embedder import blob_to_vector, embed_query
+
+    query_vec = embed_query(query, embedding_model)
+
+    rows_sql = f"""
+        SELECT
+          c.chunk_id AS chunk_id, d.id AS doc_id, d.title AS title, d.type AS type,
+          d.started AS started, d.ended AS ended, d.path AS path,
+          c.text AS snippet, e.vector AS vector
+        FROM embeddings e
+        JOIN chunks c ON c.chunk_id = e.chunk_id
+        JOIN documents d ON d.id = c.doc_id
+        WHERE e.model = ? AND {where_clause}
+    """
+    rows = conn.execute(rows_sql, [embedding_model, *params]).fetchall()
+
+    scored = []
+    for row in rows:
+        vec = blob_to_vector(row["vector"])
+        cos = float(np.dot(query_vec, vec))  # both L2-normalized -> dot == cosine
+        scored.append((row["chunk_id"], row["doc_id"], row, cos))
+    scored.sort(key=lambda t: t[3], reverse=True)
+    return scored[:TOP_N_PER_RANKER]
+
+
+def _search(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    doc_type: str | None,
+    tag: str | None,
+    date_from: str | None,
+    date_to: str | None,
+    k: int,
+    embedding_model: str,
+) -> list[SearchHit]:
+    where_clause, params = _doc_filter(
+        doc_type=doc_type, tag=tag, date_from=date_from, date_to=date_to
+    )
+
+    lexical_rows = _lexical_ranked_chunks(conn, query, where_clause, params)
+    dense_rows = _dense_ranked_chunks(conn, query, where_clause, params, embedding_model)
+
+    rrf_scores: dict[str, float] = {}
+    chunk_meta: dict[str, sqlite3.Row] = {}
+    doc_of_chunk: dict[str, str] = {}
+
+    for rank, row in enumerate(lexical_rows, start=1):
+        cid = row["chunk_id"]
+        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (RRF_K + rank)
+        chunk_meta.setdefault(cid, row)
+        doc_of_chunk[cid] = row["doc_id"]
+
+    for rank, (cid, doc_id, row, _cos) in enumerate(dense_rows, start=1):
+        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (RRF_K + rank)
+        chunk_meta.setdefault(cid, row)
+        doc_of_chunk[cid] = doc_id
 
     best_per_doc: dict[str, sqlite3.Row] = {}
     doc_scores: dict[str, float] = {}
     doc_match_counts: dict[str, int] = {}
-    for row in rows:
-        doc_id = row["doc_id"]
-        score = -row["raw_score"]  # bm25() is lower-is-better; flip so higher is better
+    for cid, score in rrf_scores.items():
+        doc_id = doc_of_chunk[cid]
         doc_match_counts[doc_id] = doc_match_counts.get(doc_id, 0) + 1
         if doc_id not in doc_scores or score > doc_scores[doc_id]:
             doc_scores[doc_id] = score
-            best_per_doc[doc_id] = row
+            best_per_doc[doc_id] = chunk_meta[cid]
 
     ranked = sorted(
         doc_scores.keys(),

@@ -39,7 +39,16 @@ def memory_search(
     Use memory_get with a hit's doc_id to fetch the full card.
     """
     settings = load_settings()
-    hits = run_search(settings.db_path, query, doc_type=type, tag=tag, date_from=from_, date_to=to, k=k)
+    hits = run_search(
+        settings.db_path,
+        query,
+        doc_type=type,
+        tag=tag,
+        date_from=from_,
+        date_to=to,
+        k=k,
+        embedding_model=settings.embedding_model,
+    )
     if _public_only():
         hits = [h for h in hits if _visibility(settings.db_path, h.doc_id) != "private"]
     return [

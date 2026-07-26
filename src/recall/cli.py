@@ -97,15 +97,24 @@ def index(
     vault_path: Path = typer.Option(None, "--vault", help="Vault path; defaults to config/env."),
     doc: str = typer.Option(None, "--doc", help="Index only this document id."),
     all: bool = typer.Option(False, "--all", help="Rebuild the index from scratch."),
+    embed: bool = typer.Option(
+        True, "--embed/--no-embed", help="Compute dense embeddings (downloads the model on first run)."
+    ),
 ) -> None:
     """Build or update the SQLite index from the vault."""
     settings = load_settings(vault_path)
     if all:
         reset_db(settings.db_path)
-    stats = build_index(settings.vault_path, settings.db_path, doc_id=doc)
+    stats = build_index(
+        settings.vault_path,
+        settings.db_path,
+        doc_id=doc,
+        embed=embed,
+        embedding_model=settings.embedding_model,
+    )
     typer.echo(
         f"Indexed: {stats.added} added, {stats.updated} updated, "
-        f"{stats.unchanged} unchanged, {stats.removed} removed."
+        f"{stats.unchanged} unchanged, {stats.removed} removed, {stats.embedded} chunks embedded."
     )
 
 
@@ -119,10 +128,17 @@ def search(
     k: int = typer.Option(10, "-k", help="Number of results."),
     vault_path: Path = typer.Option(None, "--vault", help="Vault path; defaults to config/env."),
 ) -> None:
-    """Search the memory index (lexical BM25)."""
+    """Search the memory index (hybrid: lexical BM25 + dense embeddings, fused with RRF)."""
     settings = load_settings(vault_path)
     hits = run_search(
-        settings.db_path, query, doc_type=type, tag=tag, date_from=from_, date_to=to, k=k
+        settings.db_path,
+        query,
+        doc_type=type,
+        tag=tag,
+        date_from=from_,
+        date_to=to,
+        k=k,
+        embedding_model=settings.embedding_model,
     )
     if not hits:
         typer.echo("No results.")

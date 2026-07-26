@@ -11,11 +11,21 @@ before starting a new phase.
 - `src/recall/db.py` — SQLite DDL (documents, chunks, chunks_fts, embeddings, tags, entities,
   mentions, ingest_log) and `connect()`/`reset()`.
 - `src/recall/chunker.py`, `src/recall/indexer.py` — section-aware chunking and index build.
-- `src/recall/search.py` — BM25 lexical search (`SearchHit`, `search()`).
-- `src/recall/cli.py` — Typer CLI (`recall init|new|validate|index|search|show`).
+  `indexer.build_index(..., embed=, embedding_model=)` batches new/changed/model-mismatched chunks
+  through `embedder.py` (32 at a time) after the lexical upsert.
+- `src/recall/embedder.py` — Phase 3 `sentence-transformers` wrapper: `embed_passages`,
+  `embed_query`, `vector_to_blob`/`blob_to_vector` (float32 blobs in `embeddings.vector`). Models
+  are cached in-process by name. BGE-M3 needs no query/passage instruction prefix, unlike e5-style
+  models — don't add one if the default model ever changes to something that does need it.
+- `src/recall/search.py` — hybrid search: BM25 (`chunks_fts`) + cosine similarity over `embeddings`,
+  fused per-chunk with Reciprocal Rank Fusion (`SearchHit`, `search()`). The dense branch is a
+  no-op (no model load, no download) whenever the candidate set has zero rows for the requested
+  `embedding_model` in `embeddings` — this is what keeps lexical-only tests/usage fast.
+- `src/recall/cli.py` — Typer CLI (`recall init|new|validate|index|search|show`). `recall index`
+  defaults to `--embed`; pass `--no-embed` for a lexical-only rebuild with no model download.
 - `src/recall/mcp_server.py` — Phase 2 MCP server (`memory_search`, `memory_get`, `memory_stats`),
   entry point `recall-mcp`. Read-only; wraps `search.py` and `db.py` directly rather than
-  duplicating logic.
+  duplicating logic. `memory_search` uses hybrid retrieval same as the CLI.
 - `tests/conftest.py` — `vault_path` fixture (empty temp vault + config) and `make_project_card`
   helper. Reuse these rather than hand-rolling vault fixtures in new test files.
 
@@ -35,6 +45,10 @@ before starting a new phase.
   or a local backend — not a hosted API key.
 - Config resolution order: `--vault` flag > `RECALL_VAULT` env var > `<vault>/.recall/config.yaml`
   > `Settings` defaults. `load_settings()` in `config.py` is the single place this happens.
+- **`embeddings.model` tracks provenance per row.** Never assume all rows share one model — a
+  config change leaves old rows around until `recall index --embed` overwrites them chunk-by-chunk.
+  `indexer._stale_embedding_doc_ids()` is how re-embed-on-model-change is detected; don't bypass it
+  by comparing content_hash alone.
 
 ## Testing
 
@@ -49,11 +63,20 @@ For MCP tool tests: call the decorated tool functions directly as plain Python c
 subprocess via `mcp.client.stdio.stdio_client`) is worth rerunning by hand after touching
 `mcp_server.py`, but isn't part of the automated suite.
 
+`tests/test_hybrid_search.py` covers Phase 3 (embedding storage, model-change re-embed, dense
+retrieval on zero keyword overlap, lexical-only fallback). It deliberately overrides
+`embedding_model` to `sentence-transformers/all-MiniLM-L6-v2`/`-L12-v2` (~80MB) instead of the
+production default `bge-m3` (~2GB) so the suite stays fast and offline-after-first-run —
+`embedder.py` is model-agnostic so this doesn't skip anything model-specific. Existing
+lexical-only tests (`test_search.py`, `test_mcp_server.py`) still call `build_index(...)` with no
+`embed=` argument (defaults to `False`), so they never load a model and are unaffected by Phase 3.
+
 ## Phase status (keep in sync with README.md)
 
-Done: Phase 0 (schema/vault), Phase 1 (index/search), Phase 2 (MCP server).
-Next: Phase 3 — embeddings + hybrid retrieval (`embedder.py`, `bge-m3`, RRF fusion). See build plan
-§12 for acceptance criteria (a Farsi query must retrieve a relevant English card).
+Done: Phase 0 (schema/vault), Phase 1 (index/search), Phase 2 (MCP server), Phase 3
+(embeddings/hybrid retrieval — `embedder.py`, `bge-m3` default, RRF fusion in `search.py`).
+Next: Phase 4 — automated folder ingestion (harvest → draft → review → commit → index). See build
+plan §5.
 
 When starting the next phase: update README's Status section and this file's Phase status line in
 the same commit as the code — they're the two places that drift if skipped.
