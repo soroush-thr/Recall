@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import subprocess
 from datetime import date
 from pathlib import Path
 
 import typer
+from pydantic import ValidationError
 
 from recall.config import load_settings, write_default_config
 from recall.db import reset as reset_db
 from recall.indexer import build_index
+from recall.ingest.backends import HandoffRequired, get_backend
+from recall.ingest.harvest import harvest, harvest_and_store
+from recall.ingest.review import UnknownMarkersRemain, commit_draft, inspect_draft
+from recall.ingest.synthesize import draft as run_draft
 from recall.schema import CARD_TYPES
 from recall.search import search as run_search
 from recall.vault import TYPE_DIRS, load_card, validate_vault
@@ -165,6 +171,180 @@ def show(
             return
     typer.echo(f"No document with id {doc_id!r} found.", err=True)
     raise typer.Exit(1)
+
+
+@app.command()
+def ingest(
+    folder: Path = typer.Argument(..., help="Project folder to harvest."),
+    doc_type: str = typer.Option("project", "--type", help=f"One of: {', '.join(CARD_TYPES.keys())}"),
+    id: str = typer.Option(None, "--id", help="Slug id; derived from folder name if omitted."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Harvest only; print a summary, write nothing."
+    ),
+    vault_path: Path = typer.Option(None, "--vault", help="Vault path; defaults to config/env."),
+) -> None:
+    """Harvest a project folder into an evidence bundle (Stage A of folder ingestion)."""
+    if doc_type not in CARD_TYPES:
+        typer.echo(f"Unknown type {doc_type!r}. Must be one of: {', '.join(CARD_TYPES.keys())}", err=True)
+        raise typer.Exit(1)
+    folder = folder.resolve()
+    if not folder.is_dir():
+        typer.echo(f"Not a directory: {folder}", err=True)
+        raise typer.Exit(1)
+    slug = id or _slugify(folder.name)
+
+    if dry_run:
+        bundle = harvest(folder, doc_type=doc_type)
+        git = bundle["git"]
+        typer.echo(f"Folder: {bundle['folder']}")
+        typer.echo(f"Tree entries: {len(bundle['tree'])}")
+        typer.echo(f"Languages: {bundle['languages']}")
+        typer.echo(f"Dependencies: { {k: len(v) for k, v in bundle['dependencies'].items()} }")
+        typer.echo(f"Documentation chars: {len(bundle['documentation'])}")
+        if git:
+            typer.echo(
+                f"Git: {git['commit_count']} commits, "
+                f"{git['first_commit_date']}–{git['last_commit_date']}, "
+                f"{len(git['contributors'])} contributor(s)"
+            )
+        else:
+            typer.echo("Git: none found")
+        typer.echo(f"Notebooks: {len(bundle['notebooks'])}")
+        typer.echo(f"Representative source files: {len(bundle['source_files'])}")
+        typer.echo(f"Config files: {len(bundle['config_files'])}")
+        typer.echo(f"License present: {bundle['license'] is not None}")
+        typer.echo(f"Bundle size: {bundle['char_count']} chars")
+        if bundle["dropped"]:
+            typer.echo(f"Dropped to stay under cap: {len(bundle['dropped'])} item(s)")
+        return
+
+    settings = load_settings(vault_path)
+    evidence_path = harvest_and_store(settings, folder, doc_type, slug)
+    typer.echo(f"Harvested {folder} -> {evidence_path}")
+    typer.echo(f"Next: recall draft {slug}")
+
+
+@app.command()
+def draft(
+    slug: str = typer.Argument(..., help="Document id / evidence slug to draft a card for."),
+    backend: str = typer.Option(None, "--backend", help="claude|ollama; defaults to config."),
+    vault_path: Path = typer.Option(None, "--vault", help="Vault path; defaults to config/env."),
+) -> None:
+    """Synthesize a draft card from a harvested evidence bundle (Stage B)."""
+    settings = load_settings(vault_path)
+    backend_name = backend or settings.llm_backend
+    try:
+        synthesis_backend = get_backend(backend_name, drafts_dir=settings.drafts_dir)
+    except ValueError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)
+
+    try:
+        draft_path = run_draft(settings, slug, synthesis_backend)
+    except FileNotFoundError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)
+    except HandoffRequired as e:
+        typer.echo(str(e))
+        return
+    typer.echo(f"Drafted {draft_path}")
+    typer.echo(f"Next: recall review {slug}")
+
+
+@app.command()
+def review(
+    slug: str = typer.Argument(..., help="Document id / draft slug to review."),
+    allow_unknown: bool = typer.Option(
+        False, "--allow-unknown", help="Allow committing with UNKNOWN — markers still present."
+    ),
+    edit: bool = typer.Option(
+        True, "--edit/--no-edit", help="Open the draft in $EDITOR before validating."
+    ),
+    vault_path: Path = typer.Option(None, "--vault", help="Vault path; defaults to config/env."),
+) -> None:
+    """Review, edit, and commit a drafted card into the vault (Stage C — the human gate)."""
+    settings = load_settings(vault_path)
+    draft_path = settings.drafts_dir / f"{slug}.md"
+    if not draft_path.exists():
+        typer.echo(f"No draft for {slug!r}; run 'recall draft {slug}' first.", err=True)
+        raise typer.Exit(1)
+
+    summary = inspect_draft(draft_path)
+    typer.echo(f"Sections present: {', '.join(summary.sections_present) or '(none)'}")
+    if summary.sections_missing:
+        typer.echo(f"Sections missing: {', '.join(summary.sections_missing)}")
+    typer.echo(f"Dates: {summary.started or '?'}–{summary.ended or '?'}")
+    typer.echo(f"Tags: {summary.tags}  Tech: {summary.tech}")
+    if summary.unknowns:
+        typer.echo(f"UNKNOWN markers ({len(summary.unknowns)}):")
+        for u in summary.unknowns:
+            typer.echo(f"  - {u}")
+
+    if edit:
+        try:
+            subprocess.run([settings.editor, str(draft_path)], check=False)
+        except FileNotFoundError:
+            typer.echo(
+                f"Could not launch editor {settings.editor!r}; edit {draft_path} manually, "
+                f"then rerun with --no-edit."
+            )
+
+    while True:
+        try:
+            dest = commit_draft(settings, slug, allow_unknown=allow_unknown)
+        except UnknownMarkersRemain as e:
+            typer.echo(str(e), err=True)
+            if not edit or not typer.confirm("Reopen editor to fix?", default=True):
+                raise typer.Exit(1)
+            subprocess.run([settings.editor, str(draft_path)], check=False)
+            continue
+        except (ValidationError, ValueError) as e:
+            typer.echo(f"Validation error: {e}", err=True)
+            if not edit or not typer.confirm("Reopen editor to fix?", default=True):
+                raise typer.Exit(1)
+            subprocess.run([settings.editor, str(draft_path)], check=False)
+            continue
+        break
+    typer.echo(f"Committed {dest}")
+
+
+@app.command()
+def remember(
+    folder: Path = typer.Argument(..., help="Project folder to remember."),
+    doc_type: str = typer.Option("project", "--type", help=f"One of: {', '.join(CARD_TYPES.keys())}"),
+    id: str = typer.Option(None, "--id", help="Slug id; derived from folder name if omitted."),
+    backend: str = typer.Option(None, "--backend", help="claude|ollama; defaults to config."),
+    vault_path: Path = typer.Option(None, "--vault", help="Vault path; defaults to config/env."),
+) -> None:
+    """Convenience wrapper: harvest -> draft -> review, with confirmations between stages."""
+    if doc_type not in CARD_TYPES:
+        typer.echo(f"Unknown type {doc_type!r}. Must be one of: {', '.join(CARD_TYPES.keys())}", err=True)
+        raise typer.Exit(1)
+    folder = folder.resolve()
+    if not folder.is_dir():
+        typer.echo(f"Not a directory: {folder}", err=True)
+        raise typer.Exit(1)
+
+    settings = load_settings(vault_path)
+    slug = id or _slugify(folder.name)
+
+    evidence_path = harvest_and_store(settings, folder, doc_type, slug)
+    typer.echo(f"Harvested {folder} -> {evidence_path}")
+
+    backend_name = backend or settings.llm_backend
+    synthesis_backend = get_backend(backend_name, drafts_dir=settings.drafts_dir)
+    try:
+        draft_path = run_draft(settings, slug, synthesis_backend)
+    except HandoffRequired as e:
+        typer.echo(str(e))
+        typer.echo(f"Then run: recall review {slug}")
+        return
+    typer.echo(f"Drafted {draft_path}")
+
+    if not typer.confirm("Open for review now?", default=True):
+        typer.echo(f"Run 'recall review {slug}' when ready.")
+        return
+    review(slug=slug, allow_unknown=False, edit=True, vault_path=vault_path)
 
 
 if __name__ == "__main__":

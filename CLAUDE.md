@@ -26,6 +26,18 @@ before starting a new phase.
 - `src/recall/mcp_server.py` — Phase 2 MCP server (`memory_search`, `memory_get`, `memory_stats`),
   entry point `recall-mcp`. Read-only; wraps `search.py` and `db.py` directly rather than
   duplicating logic. `memory_search` uses hybrid retrieval same as the CLI.
+- `src/recall/ingest/` — Phase 4 folder ingestion pipeline: `harvest.py` (deterministic folder
+  walk -> evidence bundle JSON, no LLM), `backends.py` (`SynthesisBackend` protocol;
+  `ClaudeCodeBackend` writes a `.prompt.md` file and raises `HandoffRequired` — file-handoff by
+  design, not a `claude -p` subprocess; `OllamaBackend` posts to a local Ollama server),
+  `synthesize.py` (renders `prompts/{doc_type}_card.md` with the evidence bundle, calls the
+  backend), `review.py` (the human gate — `commit_draft()` blocks on any `UNKNOWN —` marker
+  unless `allow_unknown=True`, then moves the draft into the vault, commits in the vault's git
+  repo if one exists, and reindexes just that doc). `db.record_ingest_status()` tracks one
+  `ingest_log` row per doc_id across all four stages (harvested -> drafted -> committed),
+  updating in place rather than inserting a new row per stage.
+- CLI commands `recall ingest|draft|review|remember` (`cli.py`) wire the above; `remember` is
+  harvest -> draft -> review chained with confirmations.
 - `tests/conftest.py` — `vault_path` fixture (empty temp vault + config) and `make_project_card`
   helper. Reuse these rather than hand-rolling vault fixtures in new test files.
 
@@ -74,9 +86,12 @@ lexical-only tests (`test_search.py`, `test_mcp_server.py`) still call `build_in
 ## Phase status (keep in sync with README.md)
 
 Done: Phase 0 (schema/vault), Phase 1 (index/search), Phase 2 (MCP server), Phase 3
-(embeddings/hybrid retrieval — `embedder.py`, `bge-m3` default, RRF fusion in `search.py`).
-Next: Phase 4 — automated folder ingestion (harvest → draft → review → commit → index). See build
-plan §5.
+(embeddings/hybrid retrieval — `embedder.py`, `bge-m3` default, RRF fusion in `search.py`),
+Phase 4 (folder ingestion — `src/recall/ingest/`, `recall ingest|draft|review|remember`;
+`ClaudeCodeBackend` is file-handoff only so far, not a live `claude -p` subprocess; person/note/
+artifact synthesis prompts aren't written yet, only `project_card.md`/`episode_card.md`).
+Next: Phase 5 — backfill the archive (`recall import`, `recall triage`) using the Phase 4
+pipeline. See build plan §12.
 
 When starting the next phase: update README's Status section and this file's Phase status line in
 the same commit as the code — they're the two places that drift if skipped.

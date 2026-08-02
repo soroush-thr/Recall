@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 SCHEMA_VERSION = 1
@@ -122,3 +124,40 @@ def reset(db_path: Path) -> None:
         p = Path(str(db_path) + suffix)
         if p.exists():
             p.unlink()
+
+
+def record_ingest_status(
+    conn: sqlite3.Connection,
+    *,
+    doc_id: str,
+    source: str,
+    status: str,
+    backend: str | None = None,
+    error: str | None = None,
+) -> str:
+    """Advance the ingest_log row for `doc_id` to `status`.
+
+    One logical pipeline run (harvest -> draft -> review -> commit) is tracked as a single
+    row: the first call for a doc_id inserts it, later calls update status/ended_at in place.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    row = conn.execute(
+        "SELECT run_id FROM ingest_log WHERE doc_id = ? ORDER BY started_at DESC LIMIT 1",
+        (doc_id,),
+    ).fetchone()
+    if row is not None:
+        run_id = row["run_id"]
+        conn.execute(
+            "UPDATE ingest_log SET status = ?, error = ?, ended_at = ?, "
+            "backend = COALESCE(?, backend) WHERE run_id = ?",
+            (status, error, now, backend, run_id),
+        )
+    else:
+        run_id = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO ingest_log (run_id, source, doc_id, status, backend, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (run_id, source, doc_id, status, backend, now),
+        )
+    conn.commit()
+    return run_id

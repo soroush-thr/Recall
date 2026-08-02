@@ -16,10 +16,10 @@ Full design and rationale: [RECALL-BUILD-PLAN.md](RECALL-BUILD-PLAN.md).
   truth. Five card types: `project`, `person`, `episode`, `note`, `artifact`.
 - **Index** — a derived, disposable SQLite database (FTS5 + eventually vector search) built from
   the vault. Always rebuildable with `recall index --all`.
-- **Ingestion** *(planned)* — point `recall ingest <folder>` at a real project directory; it
-  harvests git history, README, dependencies, and source files into an evidence bundle, drafts a
-  card from that evidence with an LLM, and blocks commit until every unsupported claim is either
-  filled in or marked `UNKNOWN` by a human reviewer.
+- **Ingestion** — point `recall ingest <folder>` at a real project directory; it harvests git
+  history, README, dependencies, and source files into an evidence bundle, drafts a card from
+  that evidence with an LLM, and blocks commit until every unsupported claim is either filled in
+  or marked `UNKNOWN` by a human reviewer.
 
 The vault lives in its own separate (private) repo — this repo is just the tool.
 
@@ -39,9 +39,16 @@ Building in phases per the build plan. Currently implemented:
   lexical index. `recall search` / `memory_search` fuse BM25 and cosine-similarity rankings with
   Reciprocal Rank Fusion, so a Farsi query can retrieve an English card (or a query with no
   keyword overlap can still find a conceptually related project) purely through the dense side.
+- **Phase 4 — Folder ingestion**: `recall ingest <folder>` deterministically harvests a project
+  directory (git history, README, dependencies, representative source files, notebooks) into an
+  evidence bundle capped at ~50k characters; `recall draft` synthesizes a card from that evidence
+  (file-handoff to Claude Code by default, or a local Ollama model); `recall review` is the
+  non-negotiable human gate — it blocks committing a card into the vault while any
+  `UNKNOWN — ...` marker remains, unless `--allow-unknown` is passed. `recall remember <folder>`
+  chains all three stages with confirmations between them. Currently ships `project` and
+  `episode` synthesis prompts; person/note/artifact prompts aren't written yet.
 
-Not yet built: automated folder ingestion (Phase 4), backfill (Phase 5), reranking/hygiene tooling
-(Phase 6).
+Not yet built: backfill across the archive (Phase 5), reranking/hygiene tooling (Phase 6).
 
 ## Setup
 
@@ -64,6 +71,16 @@ recall index [--vault <path>] [--all] [--no-embed]
 recall search "<query>" [--vault <path>] [--type project] [--tag x] [--from 2023] [--to 2025] [-k 10]
                                        # hybrid BM25 + dense search, fused with RRF
 recall show <doc-id> [--vault <path>] # print a card
+
+recall ingest <folder> [--type project] [--id SLUG] [--dry-run] [--vault <path>]
+                                       # Stage A: harvest a folder into an evidence bundle
+                                       #   --dry-run prints a summary and writes nothing
+recall draft <slug> [--backend claude|ollama] [--vault <path>]
+                                       # Stage B: synthesize a draft card from the evidence bundle
+recall review <slug> [--allow-unknown] [--edit/--no-edit] [--vault <path>]
+                                       # Stage C: the human gate — edit, validate, commit, index
+recall remember <folder> [--type project] [--backend claude|ollama] [--vault <path>]
+                                       # convenience wrapper: ingest -> draft -> review
 ```
 
 `RECALL_VAULT` env var sets the default vault path so `--vault` can be omitted.
