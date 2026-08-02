@@ -47,8 +47,14 @@ Building in phases per the build plan. Currently implemented:
   `UNKNOWN — ...` marker remains, unless `--allow-unknown` is passed. `recall remember <folder>`
   chains all three stages with confirmations between them. Currently ships `project` and
   `episode` synthesis prompts; person/note/artifact prompts aren't written yet.
+- **Phase 5 — Backfill tooling**: `recall import --glob <pattern> --type <type>` harvests and
+  drafts many folders in one pass (one bad folder doesn't stop the batch), then walks the drafted
+  queue through `recall review` one at a time. `recall triage` walks `notes/inbox/` and proposes a
+  type/title/tags/id for each loose capture, deterministically (no LLM) — accept, edit, or defer
+  each one. Actually populating the vault with the archive is manual, ongoing work, not a code
+  deliverable.
 
-Not yet built: backfill across the archive (Phase 5), reranking/hygiene tooling (Phase 6).
+Not yet built: reranking/hygiene tooling (Phase 6).
 
 ## Setup
 
@@ -81,6 +87,9 @@ recall review <slug> [--allow-unknown] [--edit/--no-edit] [--vault <path>]
                                        # Stage C: the human gate — edit, validate, commit, index
 recall remember <folder> [--type project] [--backend claude|ollama] [--vault <path>]
                                        # convenience wrapper: ingest -> draft -> review
+recall import --glob "<pattern>" [--type project] [--backend claude|ollama] [--no-review] [--vault <path>]
+                                       # bulk: harvest+draft every folder matching the glob, then review the queue
+recall triage [--vault <path>]        # walk notes/inbox/, propose type/title/tags per item, accept/edit/defer
 ```
 
 `RECALL_VAULT` env var sets the default vault path so `--vault` can be omitted.

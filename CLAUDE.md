@@ -38,6 +38,17 @@ before starting a new phase.
   updating in place rather than inserting a new row per stage.
 - CLI commands `recall ingest|draft|review|remember` (`cli.py`) wire the above; `remember` is
   harvest -> draft -> review chained with confirmations.
+- `src/recall/ingest/bulk.py` — Phase 5 bulk ingestion: `expand_glob()` (glob -> sorted existing
+  directories) and `bulk_ingest()` (harvest + draft every matching folder, catching per-folder
+  exceptions into a `BulkResult` list so one bad folder doesn't stop the batch). `recall import`
+  (`cli.py`) wires this up, then walks the drafted queue through the existing `review()` command
+  one slug at a time.
+- `src/recall/ingest/triage.py` — Phase 5 inbox triage: `scan_inbox()` walks `notes/inbox/`
+  (`.md`/`.txt` files only) and proposes a type (always `note` for now), title (first non-blank
+  line), tags (`#hashtag` scan), and id per file — deterministic, no LLM. `commit_item()` builds
+  the chosen card type via `model_for_type()`, writes it with `vault.save_card`, deletes the inbox
+  file, and reindexes just that doc. `recall triage` (`cli.py`) is the interactive accept/edit/
+  defer loop over these proposals.
 - `tests/conftest.py` — `vault_path` fixture (empty temp vault + config) and `make_project_card`
   helper. Reuse these rather than hand-rolling vault fixtures in new test files.
 
@@ -89,9 +100,14 @@ Done: Phase 0 (schema/vault), Phase 1 (index/search), Phase 2 (MCP server), Phas
 (embeddings/hybrid retrieval — `embedder.py`, `bge-m3` default, RRF fusion in `search.py`),
 Phase 4 (folder ingestion — `src/recall/ingest/`, `recall ingest|draft|review|remember`;
 `ClaudeCodeBackend` is file-handoff only so far, not a live `claude -p` subprocess; person/note/
-artifact synthesis prompts aren't written yet, only `project_card.md`/`episode_card.md`).
-Next: Phase 5 — backfill the archive (`recall import`, `recall triage`) using the Phase 4
-pipeline. See build plan §12.
+artifact synthesis prompts aren't written yet, only `project_card.md`/`episode_card.md`),
+Phase 5 (backfill tooling — `src/recall/ingest/bulk.py` + `recall import` for batched
+harvest/draft/review over a glob of folders; `src/recall/ingest/triage.py` + `recall triage` for
+turning `notes/inbox/` captures into cards). Actually running these over the archive to reach the
+build plan's coverage targets (≥25 projects, ≥10 people, ≥10 episodes) is manual, ongoing work,
+not a code deliverable — nothing to track here beyond the tooling existing.
+Next: Phase 6 — reranker, `recall verify`/`doctor`, entity merge, `related`, timeline view,
+`export --visibility shareable`. See build plan §12.
 
 When starting the next phase: update README's Status section and this file's Phase status line in
 the same commit as the code — they're the two places that drift if skipped.

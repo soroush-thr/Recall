@@ -13,9 +13,11 @@ from recall.config import load_settings, write_default_config
 from recall.db import reset as reset_db
 from recall.indexer import build_index
 from recall.ingest.backends import HandoffRequired, get_backend
+from recall.ingest.bulk import bulk_ingest
 from recall.ingest.harvest import harvest, harvest_and_store
 from recall.ingest.review import UnknownMarkersRemain, commit_draft, inspect_draft
 from recall.ingest.synthesize import draft as run_draft
+from recall.ingest.triage import scan_inbox, commit_item as triage_commit_item
 from recall.schema import CARD_TYPES
 from recall.search import search as run_search
 from recall.vault import TYPE_DIRS, load_card, validate_vault
@@ -345,6 +347,101 @@ def remember(
         typer.echo(f"Run 'recall review {slug}' when ready.")
         return
     review(slug=slug, allow_unknown=False, edit=True, vault_path=vault_path)
+
+
+@app.command(name="import")
+def import_(
+    glob: str = typer.Option(..., "--glob", help='Glob pattern for folders, e.g. "D:/projects/*".'),
+    doc_type: str = typer.Option("project", "--type", help=f"One of: {', '.join(CARD_TYPES.keys())}"),
+    backend: str = typer.Option(None, "--backend", help="claude|ollama; defaults to config."),
+    review_now: bool = typer.Option(
+        True, "--review/--no-review", help="Walk the drafted queue for review after harvesting/drafting."
+    ),
+    vault_path: Path = typer.Option(None, "--vault", help="Vault path; defaults to config/env."),
+) -> None:
+    """Bulk-ingest many folders: harvest all, draft all, then review one at a time."""
+    if doc_type not in CARD_TYPES:
+        typer.echo(f"Unknown type {doc_type!r}. Must be one of: {', '.join(CARD_TYPES.keys())}", err=True)
+        raise typer.Exit(1)
+
+    settings = load_settings(vault_path)
+    backend_name = backend or settings.llm_backend
+    synthesis_backend = get_backend(backend_name, drafts_dir=settings.drafts_dir)
+
+    results = bulk_ingest(settings, glob, doc_type, synthesis_backend)
+    if not results:
+        typer.echo(f"No folders matched: {glob}")
+        return
+
+    for r in results:
+        typer.echo(f"{r.slug:30s} {r.stage}" + (f"  ({r.error})" if r.error else ""))
+
+    drafted = [r.slug for r in results if r.stage == "drafted"]
+    handoff = [r.slug for r in results if r.stage == "handoff"]
+    failed = [r for r in results if r.stage == "failed"]
+    typer.echo(
+        f"\n{len(drafted)} drafted, {len(handoff)} awaiting handoff, {len(failed)} failed."
+    )
+    if handoff:
+        typer.echo("Run 'recall draft <slug>' again for handoff items once the prompt is answered.")
+
+    if not drafted:
+        return
+    if not review_now or not typer.confirm(f"Review {len(drafted)} drafted card(s) now?", default=True):
+        for slug in drafted:
+            typer.echo(f"Run 'recall review {slug}' when ready.")
+        return
+
+    for slug in drafted:
+        typer.echo(f"\n--- Reviewing {slug} ---")
+        review(slug=slug, allow_unknown=False, edit=True, vault_path=vault_path)
+        if not typer.confirm("Continue to next draft?", default=True):
+            break
+
+
+@app.command()
+def triage(
+    vault_path: Path = typer.Option(None, "--vault", help="Vault path; defaults to config/env."),
+) -> None:
+    """Walk notes/inbox/ and turn loose captures into real cards (accept, edit, or defer each)."""
+    settings = load_settings(vault_path)
+    items = scan_inbox(settings.vault_path)
+    if not items:
+        typer.echo("Inbox is empty.")
+        return
+
+    for item in items:
+        typer.echo(f"\n--- {item.path.name} ---")
+        typer.echo(item.text.strip()[:300])
+        typer.echo(
+            f"\nProposed: type={item.proposed_type}  title={item.proposed_title!r}  "
+            f"id={item.proposed_id}  tags={item.proposed_tags}"
+        )
+        action = typer.prompt("Accept, edit, or defer? [a/e/d]", default="a")
+        if action.lower().startswith("d"):
+            typer.echo("Deferred.")
+            continue
+
+        doc_type = item.proposed_type
+        title = item.proposed_title
+        doc_id = item.proposed_id
+        tags = item.proposed_tags
+        if action.lower().startswith("e"):
+            doc_type = typer.prompt("Type", default=doc_type)
+            if doc_type not in CARD_TYPES:
+                typer.echo(f"Unknown type {doc_type!r}; deferring.", err=True)
+                continue
+            title = typer.prompt("Title", default=title)
+            doc_id = typer.prompt("Id", default=doc_id)
+            tags_str = typer.prompt("Tags (comma-separated)", default=", ".join(tags))
+            tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+
+        try:
+            dest = triage_commit_item(settings, item, doc_type=doc_type, title=title, doc_id=doc_id, tags=tags)
+        except (ValidationError, ValueError, FileExistsError) as e:
+            typer.echo(f"Could not commit: {e}", err=True)
+            continue
+        typer.echo(f"Committed {dest}")
 
 
 if __name__ == "__main__":
