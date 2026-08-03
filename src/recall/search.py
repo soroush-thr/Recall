@@ -12,6 +12,7 @@ from recall.db import connect
 
 RRF_K = 60
 TOP_N_PER_RANKER = 50
+RERANK_TOP_N = 20
 
 
 @dataclass
@@ -36,6 +37,8 @@ def search(
     date_to: str | None = None,
     k: int = 10,
     embedding_model: str = "BAAI/bge-m3",
+    rerank: bool = False,
+    rerank_model: str = "BAAI/bge-reranker-v2-m3",
 ) -> list[SearchHit]:
     conn = connect(db_path)
     try:
@@ -48,6 +51,8 @@ def search(
             date_to=date_to,
             k=k,
             embedding_model=embedding_model,
+            rerank=rerank,
+            rerank_model=rerank_model,
         )
     finally:
         conn.close()
@@ -146,6 +151,8 @@ def _search(
     date_to: str | None,
     k: int,
     embedding_model: str,
+    rerank: bool = False,
+    rerank_model: str = "BAAI/bge-reranker-v2-m3",
 ) -> list[SearchHit]:
     where_clause, params = _doc_filter(
         doc_type=doc_type, tag=tag, date_from=date_from, date_to=date_to
@@ -185,6 +192,18 @@ def _search(
         reverse=True,
     )
 
+    final_scores = dict(doc_scores)
+    if rerank and ranked:
+        from recall.reranker import rerank as rerank_fn
+
+        candidates = ranked[:RERANK_TOP_N]
+        texts = [best_per_doc[d]["snippet"] for d in candidates]
+        rerank_scores = rerank_fn(query, texts, rerank_model)
+        for doc_id, score in zip(candidates, rerank_scores):
+            final_scores[doc_id] = score
+        candidates.sort(key=lambda d: final_scores[d], reverse=True)
+        ranked = candidates + [d for d in ranked if d not in candidates]
+
     hits = []
     for doc_id in ranked[:k]:
         row = best_per_doc[doc_id]
@@ -195,7 +214,7 @@ def _search(
                 type=row["type"],
                 started=row["started"],
                 ended=row["ended"],
-                score=doc_scores[doc_id],
+                score=final_scores[doc_id],
                 snippet=row["snippet"][:300],
                 path=row["path"],
             )

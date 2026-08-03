@@ -53,8 +53,21 @@ Building in phases per the build plan. Currently implemented:
   type/title/tags/id for each loose capture, deterministically (no LLM) — accept, edit, or defer
   each one. Actually populating the vault with the archive is manual, ongoing work, not a code
   deliverable.
+- **Phase 6 — Reranker + hygiene**: `recall search --rerank` reranks the top ~20 RRF candidates
+  with a multilingual cross-encoder (`BAAI/bge-reranker-v2-m3`), lazily loaded so plain search
+  stays fast and offline. `recall verify` flags cards with a stale (>180d) or missing
+  `last_verified`, or a `provenance.sources` path that no longer exists on disk, and walks them
+  interactively (re-confirm / edit / skip). `recall doctor` (`--fix` to repair) checks for orphaned
+  chunks, vault/index content drift, missing or stale-model embeddings, duplicate ids, and schema
+  validation failures — only drift and orphaned chunks are auto-repairable, the rest are
+  report-only. `recall entity merge <id-a> <id-b>` folds one entity into another (merges
+  `mentions`, rewrites frontmatter references, deletes the losing id) — manual and deterministic,
+  no automated resolution. `recall export --visibility shareable` emits portfolio-ready markdown,
+  stripped of internal-only frontmatter fields, for cards at that visibility level (never
+  `private`/`confidential`). Timeline view, coverage stats, and most of `related` are left to
+  Obsidian/Dataview per build plan §15, not reimplemented here.
 
-Not yet built: reranking/hygiene tooling (Phase 6).
+Everything through Phase 6 is now implemented.
 
 ## Setup
 

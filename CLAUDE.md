@@ -49,6 +49,29 @@ before starting a new phase.
   the chosen card type via `model_for_type()`, writes it with `vault.save_card`, deletes the inbox
   file, and reindexes just that doc. `recall triage` (`cli.py`) is the interactive accept/edit/
   defer loop over these proposals.
+- `src/recall/reranker.py` — Phase 6 cross-encoder reranker (`BAAI/bge-reranker-v2-m3`), same
+  lazy-model-load-and-cache pattern as `embedder.py`. `search._search()` only imports/calls it when
+  `rerank=True`; it re-scores the top `RERANK_TOP_N` (20) RRF candidates and re-sorts them, with
+  the cross-encoder score replacing the RRF score for those docs. `recall search --rerank` wires
+  this up in `cli.py`.
+- `src/recall/hygiene.py` — Phase 6 `recall verify`/`recall doctor`. `find_stale()` flags cards
+  with `last_verified` missing or >180 days old, or a `provenance.sources` path that no longer
+  exists; `reconfirm_card()` bumps `last_verified`/`updated` to today and rewrites the card.
+  `run_doctor()` builds a `DoctorReport` (orphaned chunks, vault/index content-hash drift, chunks
+  missing embeddings, embeddings from a model other than the current config, duplicate ids across
+  vault files, `vault.validate_vault()` schema failures); `fix_doctor_report()` only reindexes
+  drifted docs and deletes orphaned chunk rows — it never auto-fixes duplicate ids or schema
+  failures.
+- `src/recall/entities.py` — Phase 6 `recall entity merge <id-a> <id-b>`: manual, deterministic
+  merge (build plan §8 — no automated resolution). Rewrites `mentions` rows (summing counts on
+  collision), deletes the `entities` row for id-a, and rewrites any frontmatter
+  `entities.{people,orgs,projects}` reference to id-a in every vault card, reindexing each doc it
+  touches.
+- `src/recall/export.py` — Phase 6 `recall export --visibility shareable`: `export_cards()` walks
+  the vault, keeps only cards matching the requested visibility (confidential is refused outright,
+  matching the unconditional exclusion rule below), strips `provenance`/`last_verified`/
+  `confidence`/`visibility` from the frontmatter, and writes one markdown file per card into the
+  output directory.
 - `tests/conftest.py` — `vault_path` fixture (empty temp vault + config) and `make_project_card`
   helper. Reuse these rather than hand-rolling vault fixtures in new test files.
 
@@ -103,11 +126,21 @@ Phase 4 (folder ingestion — `src/recall/ingest/`, `recall ingest|draft|review|
 artifact synthesis prompts aren't written yet, only `project_card.md`/`episode_card.md`),
 Phase 5 (backfill tooling — `src/recall/ingest/bulk.py` + `recall import` for batched
 harvest/draft/review over a glob of folders; `src/recall/ingest/triage.py` + `recall triage` for
-turning `notes/inbox/` captures into cards). Actually running these over the archive to reach the
-build plan's coverage targets (≥25 projects, ≥10 people, ≥10 episodes) is manual, ongoing work,
-not a code deliverable — nothing to track here beyond the tooling existing.
-Next: Phase 6 — reranker, `recall verify`/`doctor`, entity merge, `related`, timeline view,
-`export --visibility shareable`. See build plan §12.
+turning `notes/inbox/` captures into cards), Phase 6 (reranker — `reranker.py`, lazy-loaded
+`BAAI/bge-reranker-v2-m3` cross-encoder wired into `search.py`/`recall search --rerank`, reranks
+the top ~20 RRF candidates and re-sorts, never loaded on a plain search; hygiene — `hygiene.py` +
+`recall verify` (flags stale/missing `last_verified` >180d or a dead `provenance.sources` path,
+interactive re-confirm/edit/skip) and `recall doctor`/`--fix` (orphaned chunks, vault/index content
+drift, missing/stale-model embeddings, duplicate ids, schema validation failures — only drift and
+orphaned chunks are auto-repaired, the rest report-only); entity merge — `entities.py` +
+`recall entity merge <id-a> <id-b>` (manual, deterministic: merges `mentions` rows, rewrites
+frontmatter `entities.*` references, deletes the losing id); export — `export.py` +
+`recall export --visibility shareable` (portfolio-ready markdown, internal frontmatter fields
+stripped, confidential/private always excluded)). Actually running the ingestion tooling over the
+archive to reach the build plan's coverage targets (≥25 projects, ≥10 people, ≥10 episodes) is
+manual, ongoing work, not a code deliverable — nothing to track here beyond the tooling existing.
+Next: nothing scoped — `related`, timeline view, and coverage stats are intentionally left to
+Obsidian/Dataview per build plan §15 rather than reimplemented in `recall`.
 
 When starting the next phase: update README's Status section and this file's Phase status line in
 the same commit as the code — they're the two places that drift if skipped.

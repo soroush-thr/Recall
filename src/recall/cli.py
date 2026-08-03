@@ -11,6 +11,9 @@ from pydantic import ValidationError
 
 from recall.config import load_settings, write_default_config
 from recall.db import reset as reset_db
+from recall.entities import merge_entities
+from recall.export import export_cards
+from recall.hygiene import find_stale, reconfirm_card, run_doctor, fix_doctor_report
 from recall.indexer import build_index
 from recall.ingest.backends import HandoffRequired, get_backend
 from recall.ingest.bulk import bulk_ingest
@@ -23,6 +26,8 @@ from recall.search import search as run_search
 from recall.vault import TYPE_DIRS, load_card, validate_vault
 
 app = typer.Typer(add_completion=False, help="Recall — a local-first personal memory system.")
+entity_app = typer.Typer(add_completion=False, help="Entity maintenance (manual, deterministic).")
+app.add_typer(entity_app, name="entity")
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent.parent / "templates"
 
@@ -134,6 +139,9 @@ def search(
     from_: str = typer.Option(None, "--from", help="Filter: started >= this date."),
     to: str = typer.Option(None, "--to", help="Filter: started <= this date."),
     k: int = typer.Option(10, "-k", help="Number of results."),
+    rerank: bool = typer.Option(
+        False, "--rerank", help="Rerank top candidates with a cross-encoder (downloads the model on first run)."
+    ),
     vault_path: Path = typer.Option(None, "--vault", help="Vault path; defaults to config/env."),
 ) -> None:
     """Search the memory index (hybrid: lexical BM25 + dense embeddings, fused with RRF)."""
@@ -147,6 +155,7 @@ def search(
         date_to=to,
         k=k,
         embedding_model=settings.embedding_model,
+        rerank=rerank,
     )
     if not hits:
         typer.echo("No results.")
@@ -442,6 +451,118 @@ def triage(
             typer.echo(f"Could not commit: {e}", err=True)
             continue
         typer.echo(f"Committed {dest}")
+
+
+@app.command()
+def verify(
+    vault_path: Path = typer.Option(None, "--vault", help="Vault path; defaults to config/env."),
+) -> None:
+    """Flag cards with stale last_verified (>180d) or missing provenance source paths; walk them
+    interactively (re-confirm / update in editor / skip)."""
+    settings = load_settings(vault_path)
+    flags = find_stale(settings.vault_path)
+    if not flags:
+        typer.echo("Nothing to verify — all cards are fresh.")
+        return
+
+    for flag in flags:
+        typer.echo(f"\n--- {flag.doc_id} ---")
+        for reason in flag.reasons:
+            typer.echo(f"  - {reason}")
+        action = typer.prompt("Re-confirm, update in editor, or skip? [y/u/s]", default="s")
+        if action.lower().startswith("y"):
+            reconfirm_card(settings.vault_path, flag.path)
+            typer.echo(f"Re-confirmed {flag.doc_id}.")
+        elif action.lower().startswith("u"):
+            try:
+                subprocess.run([settings.editor, str(flag.path)], check=False)
+            except FileNotFoundError:
+                typer.echo(f"Could not launch editor {settings.editor!r}; edit {flag.path} manually.")
+            reconfirm_card(settings.vault_path, flag.path)
+            typer.echo(f"Updated and re-confirmed {flag.doc_id}.")
+        else:
+            typer.echo(f"Skipped {flag.doc_id}.")
+
+
+@app.command()
+def doctor(
+    fix: bool = typer.Option(False, "--fix", help="Repair what's safely repairable."),
+    vault_path: Path = typer.Option(None, "--vault", help="Vault path; defaults to config/env."),
+) -> None:
+    """Integrity check over the index and vault (orphaned chunks, content drift, missing/stale
+    embeddings, duplicate ids, schema validation failures)."""
+    settings = load_settings(vault_path)
+    report = run_doctor(settings.vault_path, settings.db_path, embedding_model=settings.embedding_model)
+
+    if report.is_clean:
+        typer.echo("No issues found.")
+        return
+
+    if report.orphaned_chunk_ids:
+        typer.echo(f"Orphaned chunks ({len(report.orphaned_chunk_ids)}): {report.orphaned_chunk_ids}")
+    if report.drifted_doc_ids:
+        typer.echo(f"Content drift (db out of sync with vault file): {report.drifted_doc_ids}")
+    if report.chunks_missing_embeddings:
+        typer.echo(f"Chunks missing embeddings ({len(report.chunks_missing_embeddings)})")
+    if report.stale_model_chunk_ids:
+        for model, chunk_ids in report.stale_model_chunk_ids.items():
+            typer.echo(f"Embeddings from stale model {model!r}: {len(chunk_ids)} chunk(s)")
+    if report.duplicate_ids:
+        for doc_id, paths in report.duplicate_ids.items():
+            typer.echo(f"Duplicate id {doc_id!r}: {paths}")
+    if report.schema_failures:
+        for path, message in report.schema_failures:
+            typer.echo(f"Schema validation failed: {path}: {message}", err=True)
+
+    if fix:
+        fix_doctor_report(
+            settings.vault_path, settings.db_path, report, embedding_model=settings.embedding_model
+        )
+        typer.echo(
+            f"\nFixed: reindexed {len(report.drifted_doc_ids)} drifted doc(s), "
+            f"removed {len(report.orphaned_chunk_ids)} orphaned chunk row(s). "
+            "Missing/stale embeddings, duplicate ids, and schema failures were not auto-fixed."
+        )
+    else:
+        raise typer.Exit(1)
+
+
+@entity_app.command(name="merge")
+def entity_merge(
+    id_a: str = typer.Argument(..., help="Entity id to fold away."),
+    id_b: str = typer.Argument(..., help="Entity id to keep."),
+    vault_path: Path = typer.Option(None, "--vault", help="Vault path; defaults to config/env."),
+) -> None:
+    """Fold entity id-a into id-b: merges mentions, rewrites frontmatter references, deletes id-a."""
+    settings = load_settings(vault_path)
+    try:
+        rewritten = merge_entities(
+            settings.vault_path, settings.db_path, id_a, id_b, embedding_model=settings.embedding_model
+        )
+    except ValueError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)
+    typer.echo(f"Merged {id_a!r} into {id_b!r}. Rewrote {len(rewritten)} card(s): {rewritten}")
+
+
+@app.command(name="export")
+def export_(
+    visibility: str = typer.Option("shareable", "--visibility", help="Visibility level to export."),
+    out: Path = typer.Option(None, "--out", help="Output directory; defaults to <vault>/.recall/export/."),
+    vault_path: Path = typer.Option(None, "--vault", help="Vault path; defaults to config/env."),
+) -> None:
+    """Export cards at the given visibility level as portfolio-ready markdown (never private/confidential)."""
+    settings = load_settings(vault_path)
+    out_dir = out or (settings.recall_dir / "export")
+    try:
+        written = export_cards(settings.vault_path, out_dir, visibility=visibility)
+    except ValueError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)
+    if not written:
+        typer.echo(f"No cards with visibility={visibility!r} found.")
+        return
+    typer.echo(f"Exported {len(written)} card(s) to {out_dir}")
 
 
 if __name__ == "__main__":
