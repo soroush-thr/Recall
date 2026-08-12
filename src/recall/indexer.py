@@ -56,6 +56,8 @@ def _stale_embedding_doc_ids(conn: sqlite3.Connection, embedding_model: str) -> 
 
 def _embed_pending(conn: sqlite3.Connection, chunk_ids: list[str], embedding_model: str) -> int:
     """Embed the given chunk_ids in batches, upserting into the embeddings table."""
+    import sys
+
     from recall.embedder import embed_passages, vector_to_blob
 
     if not chunk_ids:
@@ -68,9 +70,15 @@ def _embed_pending(conn: sqlite3.Connection, chunk_ids: list[str], embedding_mod
     ordered_ids = [cid for cid in chunk_ids if cid in by_id]
     now = _now()
     embedded = 0
-    for i in range(0, len(ordered_ids), EMBED_BATCH_SIZE):
+    total_batches = -(-len(ordered_ids) // EMBED_BATCH_SIZE)
+    for batch_num, i in enumerate(range(0, len(ordered_ids), EMBED_BATCH_SIZE), start=1):
         batch_ids = ordered_ids[i : i + EMBED_BATCH_SIZE]
         batch_texts = [by_id[cid] for cid in batch_ids]
+        print(
+            f"[recall] embedding batch {batch_num}/{total_batches} ({len(batch_ids)} chunks)...",
+            file=sys.stderr,
+            flush=True,
+        )
         vectors = embed_passages(batch_texts, embedding_model)
         for chunk_id, vector in zip(batch_ids, vectors):
             conn.execute(

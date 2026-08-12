@@ -8,6 +8,8 @@ don't reload weights.
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 
 _MODEL_CACHE: dict[str, object] = {}
@@ -17,7 +19,16 @@ def _get_model(model_name: str):
     if model_name not in _MODEL_CACHE:
         from sentence_transformers import SentenceTransformer
 
-        _MODEL_CACHE[model_name] = SentenceTransformer(model_name)
+        # local_files_only avoids a network round-trip (and an unbounded hang on a
+        # flaky connection) when the model is already cached; only downloads on miss.
+        try:
+            print(f"[recall] loading {model_name} from local cache...", file=sys.stderr, flush=True)
+            model = SentenceTransformer(model_name, local_files_only=True)
+        except OSError:
+            print(f"[recall] {model_name} not cached locally, downloading...", file=sys.stderr, flush=True)
+            model = SentenceTransformer(model_name)
+        print(f"[recall] {model_name} ready.", file=sys.stderr, flush=True)
+        _MODEL_CACHE[model_name] = model
     return _MODEL_CACHE[model_name]
 
 
